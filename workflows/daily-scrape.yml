@@ -1,0 +1,76 @@
+name: Daily Scrape (scam.vn + tinnhiemmang)
+
+# Runs after Supabase Edge Function cron jobs (which handle other sources).
+# scam.vn is behind Cloudflare; run FlareSolverr beside the scraper so the
+# job does not depend on a long-lived public proxy or VM.
+# checkscam.vn is intentionally not run on a hosted runner: it blocks plain
+# HTTP/datacenter access. The residential-IP job is installed by
+# scripts/install-checkscam-scheduled-task.ps1.
+on:
+  schedule:
+    # 04:00 UTC daily — after sync-threats-6h (00:00) and sync-scraped-sources (02:00)
+    - cron: '0 4 */2 * *'
+  workflow_dispatch: {}
+
+jobs:
+
+  scrape-scam-vn:
+    name: Scrape scam.vn (pages 1-10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47
+        ports:
+          - 8191:8191
+        env:
+          LOG_LEVEL: info
+          LOG_HTML: false
+          CAPTCHA_SOLVER: none
+          TZ: Asia/Ho_Chi_Minh
+        options: >-
+          --health-cmd "curl --fail --silent http://127.0.0.1:8191/"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 24
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      FLARESOLVERR_URL: http://127.0.0.1:8191
+      START_PAGE: '1'
+      END_PAGE: '10'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+
+      - name: Scrape scam.vn (pages 1-10)
+        run: deno run --allow-net --allow-env scripts/scrape-scam-vn.ts
+        timeout-minutes: 15
+
+  scrape-tinnhiemmang:
+    name: Scrape tinnhiemmang.vn (NCA blacklist + whitelists)
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATASET: all
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+
+      # Re-establishes the lost automation for tinnhiemmang.vn (Vietnam NCA).
+      # The source went stale on 2026-03-04 because no workflow ran this
+      # script - the scraper + site + parser are all still working (verified
+      # 2026-05-24: HTTP 200, 20/20 items yield a domain via the existing
+      # webkit-box-2 selector). Scrapes blacklist + 2 whitelists into
+      # threat_intel via bulk_upsert_threats.
+      - name: Scrape tinnhiemmang.vn (all datasets)
+        run: deno run --allow-net --allow-env --allow-read scripts/scrape-tinnhiemmang.ts
+        timeout-minutes: 90
+

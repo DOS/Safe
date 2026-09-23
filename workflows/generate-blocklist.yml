@@ -1,0 +1,32 @@
+name: Generate Blocklist Files
+
+# Regenerates pre-compressed blocklist files for mobile download.
+# Runs every 6 hours, after Supabase Edge Function cron jobs sync threat data.
+# Also runs after daily scrape completes.
+on:
+  schedule:
+    # Every 6 hours at :30 — offset from sync-threats-6h (which runs at :00)
+    - cron: '30 3 */2 * *'
+  workflow_run:
+    workflows: ['Daily Scrape (scam.vn + tinnhiemmang)', 'Sync Large Sources']
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  generate:
+    name: Generate & upload blocklist
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+
+      - name: Generate blocklist files
+        run: deno run --allow-net --allow-env scripts/generate-blocklist.ts
+        timeout-minutes: 45
+
