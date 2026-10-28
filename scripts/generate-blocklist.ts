@@ -44,9 +44,10 @@ async function fetchRpc(fnName: string, limit: number, cursor: string | null): P
     },
     body: JSON.stringify(body),
   })
+  // Throw rather than return []: an empty page ends pagination, so a failed
+  // call would publish a truncated or empty blocklist.
   if (!res.ok) {
-    console.error(`RPC ${fnName} error: ${res.status} ${await res.text()}`)
-    return []
+    throw new Error(`RPC ${fnName} error: ${res.status} ${await res.text()}`)
   }
   return await res.json()
 }
@@ -206,6 +207,11 @@ async function main() {
   const domains = Array.from(domainMap.values())
   console.log(`  Deduped to ${domains.length} domains`)
 
+  // Never replace the published files with an empty list.
+  if (phones.length === 0 || domains.length === 0) {
+    throw new Error(`Refusing to upload: ${phones.length} phones, ${domains.length} domains`)
+  }
+
   const now = new Date().toISOString()
 
   // Generate combined file
@@ -247,20 +253,21 @@ async function main() {
   }
   console.log(`Generating meta.json (version: ${meta.version})...`)
 
-  // Upload
+  // Upload the data files first; meta.json goes last so mobile never sees a
+  // version whose files did not upload.
   console.log('Uploading to Supabase Storage...')
   const results = await Promise.all([
     uploadToStorage('blocklist', 'blocklist.json.gz', combinedGz),
     uploadToStorage('blocklist', 'phones.json.gz', phonesGz),
     uploadToStorage('blocklist', 'domains.json.gz', domainsGz),
-    uploadJson('blocklist', 'meta.json', meta),
   ])
-
-  if (results.every(Boolean)) {
-    console.log('✅ All files uploaded successfully!')
-  } else {
-    console.error('❌ Some uploads failed')
+  if (!results.every(Boolean)) {
+    throw new Error('Some uploads failed; meta.json not updated')
   }
+  if (!await uploadJson('blocklist', 'meta.json', meta)) {
+    throw new Error('Upload meta.json failed')
+  }
+  console.log('✅ All files uploaded successfully!')
 
   console.log(`\nSummary:`)
   console.log(`  Phones: ${phones.length}`)
@@ -269,5 +276,8 @@ async function main() {
   console.log(`  Version: ${meta.version}`)
 }
 
-main()
+main().catch((err) => {
+  console.error(`❌ ${err instanceof Error ? err.message : err}`)
+  Deno.exit(1)
+})
 
