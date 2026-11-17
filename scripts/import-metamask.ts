@@ -94,7 +94,7 @@ try {
 
   // Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
   const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
-  const plan = planDelta(feedEntries, await deltaStore.load("metamask"), Date.now());
+  const plan = await planDelta(feedEntries, await deltaStore.load("metamask"), Date.now());
   const entries = plan.entries;
   console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 

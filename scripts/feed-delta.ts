@@ -24,8 +24,6 @@
 // its source was paused in dosafe.threat_source_pauses and then resumed). A delta run never loses
 // a new or changed entry.
 
-import { createHash } from 'node:crypto'
-
 export const FULL_SEND_EVERY_MS = 6 * 24 * 60 * 60 * 1000
 const STATE_VERSION = 1
 
@@ -55,13 +53,29 @@ export function stableJson(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(',')}}`
 }
 
-/** 64 bits of SHA-256 over the entry's stable JSON. */
-export function fingerprintOf(entry: unknown): string {
-  return createHash('sha256').update(stableJson(entry)).digest('hex').slice(0, 16)
+const encoder = new TextEncoder()
+const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'))
+
+/** 64 bits of SHA-256 over the entry's stable JSON (Web Crypto, so no Node types are needed). */
+export async function fingerprintOf(entry: unknown): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(stableJson(entry))))
+  let hex = ''
+  for (let i = 0; i < 8; i++) hex += HEX[digest[i]]
+  return hex
 }
 
-export function planDelta<T>(entries: T[], previous: DeltaState | null, nowMs: number): DeltaPlan<T> {
-  const fingerprints = entries.map(fingerprintOf)
+async function fingerprintAll(entries: unknown[]): Promise<string[]> {
+  const out = new Array<string>(entries.length)
+  const BATCH = 4096
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const part = await Promise.all(entries.slice(i, i + BATCH).map(fingerprintOf))
+    for (let j = 0; j < part.length; j++) out[i + j] = part[j]
+  }
+  return out
+}
+
+export async function planDelta<T>(entries: T[], previous: DeltaState | null, nowMs: number): Promise<DeltaPlan<T>> {
+  const fingerprints = await fingerprintAll(entries)
   const startedAt = new Date(nowMs).toISOString()
   const lastFullMs = previous ? Date.parse(previous.lastFullAt) : NaN
 

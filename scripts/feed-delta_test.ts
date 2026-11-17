@@ -21,43 +21,44 @@ const a = { entity_type: 'domain', entity_value: 'a.example', source: 'feed', ca
 const b = { entity_type: 'domain', entity_value: 'b.example', source: 'feed', category: 'phishing', risk_score: 80, raw_data: {} }
 const c = { entity_type: 'domain', entity_value: 'c.example', source: 'feed', category: 'scam', risk_score: 70, raw_data: {} }
 
-function stateOf(entries: unknown[], lastFullAt: string): DeltaState {
-  return { v: 1, lastFullAt, fingerprints: entries.map(fingerprintOf) }
+async function stateOf(entries: unknown[], lastFullAt: string): Promise<DeltaState> {
+  return { v: 1, lastFullAt, fingerprints: await Promise.all(entries.map(fingerprintOf)) }
 }
 
-Deno.test('stableJson ignores key order and undefined values', () => {
+Deno.test('stableJson ignores key order and undefined values', async () => {
   assertEquals(stableJson({ b: 1, a: { d: [1, { z: 1, y: 2 }], c: undefined } }), '{"a":{"d":[1,{"y":2,"z":1}]},"b":1}')
-  assertEquals(fingerprintOf({ x: 1, y: 'v' }), fingerprintOf({ y: 'v', x: 1 }))
-  assertEquals(fingerprintOf({ x: 1 }).length, 16)
+  assertEquals(await fingerprintOf({ x: 1, y: 'v' }), await fingerprintOf({ y: 'v', x: 1 }))
+  // The first 64 bits of SHA-256("{\"x\":1}").
+  assertEquals(await fingerprintOf({ x: 1 }), '5041bf1f713df204')
 })
 
-Deno.test('no saved state: everything is sent and the full send time is now', () => {
-  const plan = planDelta([a, b], null, NOW)
+Deno.test('no saved state: everything is sent and the full send time is now', async () => {
+  const plan = await planDelta([a, b], null, NOW)
   assertEquals([plan.full, plan.reason, plan.entries.length], [true, 'no_state', 2])
   assertEquals(plan.next.lastFullAt, new Date(NOW).toISOString())
-  assertEquals(plan.next.fingerprints, [fingerprintOf(a), fingerprintOf(b)])
+  assertEquals(plan.next.fingerprints, [await fingerprintOf(a), await fingerprintOf(b)])
 })
 
-Deno.test('between full sends only new and changed entries are sent', () => {
+Deno.test('between full sends only new and changed entries are sent', async () => {
   const lastFull = new Date(NOW - 2 * 86_400_000).toISOString()
   const changedA = { ...a, risk_score: 95 }
-  const plan = planDelta([changedA, b, c], stateOf([a, b], lastFull), NOW)
+  const plan = await planDelta([changedA, b, c], await stateOf([a, b], lastFull), NOW)
   assertEquals([plan.full, plan.reason], [false, 'delta'])
   assertEquals(plan.entries, [changedA, c])
   // The full send time does not move; the fingerprints are the whole current feed.
   assertEquals(plan.next.lastFullAt, lastFull)
-  assertEquals(plan.next.fingerprints, [changedA, b, c].map(fingerprintOf))
+  assertEquals(plan.next.fingerprints, await Promise.all([changedA, b, c].map(fingerprintOf)))
 })
 
-Deno.test('an unchanged feed sends nothing between full sends', () => {
-  const plan = planDelta([a, b], stateOf([b, a], new Date(NOW - 86_400_000).toISOString()), NOW)
+Deno.test('an unchanged feed sends nothing between full sends', async () => {
+  const plan = await planDelta([a, b], await stateOf([b, a], new Date(NOW - 86_400_000).toISOString()), NOW)
   assertEquals(plan.entries.length, 0)
 })
 
-Deno.test('a full send is due once the interval has passed', () => {
-  const justBefore = planDelta([a], stateOf([a], new Date(NOW - FULL_SEND_EVERY_MS + 1000).toISOString()), NOW)
+Deno.test('a full send is due once the interval has passed', async () => {
+  const justBefore = await planDelta([a], await stateOf([a], new Date(NOW - FULL_SEND_EVERY_MS + 1000).toISOString()), NOW)
   assertEquals([justBefore.full, justBefore.entries.length], [false, 0])
-  const due = planDelta([a], stateOf([a], new Date(NOW - FULL_SEND_EVERY_MS).toISOString()), NOW)
+  const due = await planDelta([a], await stateOf([a], new Date(NOW - FULL_SEND_EVERY_MS).toISOString()), NOW)
   assertEquals([due.full, due.reason, due.entries.length], [true, 'refresh_due', 1])
   assertEquals(due.next.lastFullAt, new Date(NOW).toISOString())
 })
@@ -68,9 +69,9 @@ Deno.test('the full send interval stays under the 7-day last_seen refresh', () =
   if (!(FULL_SEND_EVERY_MS < 7 * 86_400_000)) throw new Error('FULL_SEND_EVERY_MS must stay below 7 days')
 })
 
-Deno.test('a state with a bad or future time means a full send', () => {
-  assertEquals(planDelta([a], { v: 1, lastFullAt: 'nope', fingerprints: [] }, NOW).reason, 'no_state')
-  assertEquals(planDelta([a], stateOf([a], new Date(NOW + 60_000).toISOString()), NOW).reason, 'no_state')
+Deno.test('a state with a bad or future time means a full send', async () => {
+  assertEquals((await planDelta([a], { v: 1, lastFullAt: 'nope', fingerprints: [] }, NOW)).reason, 'no_state')
+  assertEquals((await planDelta([a], await stateOf([a], new Date(NOW + 60_000).toISOString()), NOW)).reason, 'no_state')
 })
 
 Deno.test('parseState accepts only the current shape', () => {
@@ -93,7 +94,7 @@ Deno.test('storageDeltaStore saves gzip JSON and loads it back; a missing object
   }) as typeof fetch
   const store = storageDeltaStore({ url: 'https://db.example', key: 'k', fetch: fakeFetch })
   assertEquals(await store.load('watchlist_internet'), null)
-  const state = stateOf([a, b], new Date(NOW).toISOString())
+  const state = await stateOf([a, b], new Date(NOW).toISOString())
   assertEquals(await store.save('watchlist_internet', state), true)
   assertEquals([...objects.keys()], ['https://db.example/storage/v1/object/dosafe-feed-state/watchlist_internet.json.gz'])
   assertEquals(await store.load('watchlist_internet'), state)
@@ -112,5 +113,5 @@ Deno.test('storageDeltaStore treats an unreadable object or a failed call as no 
     fetch: (() => Promise.reject(new Error('down'))) as typeof fetch,
   })
   assertEquals(await down.load('f'), null)
-  assertEquals(await down.save('f', stateOf([a], new Date(NOW).toISOString())), false)
+  assertEquals(await down.save('f', await stateOf([a], new Date(NOW).toISOString())), false)
 })
