@@ -25,6 +25,9 @@ jobs:
         with:
           deno-version: v2.x
 
+      - name: Test blocklist scripts
+        run: deno test scripts/blocklist-entries_test.ts scripts/blocklist-fetch_test.ts
+
       - name: Generate blocklist files
         run: deno run --allow-net --allow-env scripts/generate-blocklist.ts
         timeout-minutes: 45

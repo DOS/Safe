@@ -6,11 +6,18 @@
  *   - phones.json.gz — phone numbers only (legacy)
  *   - domains.json.gz — domains only
  *
+ * Only blocking threats are written: see scripts/blocklist-entries.ts
+ * (DOS/DOS.AI#7444). The rows are read in one pass over the table: see
+ * scripts/blocklist-fetch.ts (DOS/DOS.AI#7620).
+ *
  * Usage: deno run --allow-net --allow-env scripts/generate-blocklist.ts
  *
  * Requires: SUPABASE_SERVICE_ROLE_KEY env var.
  * Note: service_role has 120s statement_timeout (vs 8s for anon/authenticated).
  */
+
+import { buildDomainEntries, buildPhoneEntries } from './blocklist-entries.ts'
+import { fetchBlocklistRows, type Rpc } from './blocklist-fetch.ts'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ||
   Deno.env.get('NEXT_PUBLIC_SUPABASE_URL') ||
@@ -22,18 +29,8 @@ if (!SUPABASE_KEY) {
   Deno.exit(1)
 }
 
-const CHUNK_SIZE = 50000
-
-interface PhoneEntry { p: string; n: string | null; c: string; r: number }
-interface DomainEntry { d: string; c: string; s: string | null }
-
-async function fetchRpc(fnName: string, limit: number, cursor: string | null): Promise<any[]> {
-  const body: Record<string, unknown> = { p_limit: limit, p_since: null }
-  if (cursor) {
-    body.p_cursor = cursor
-  } else {
-    body.p_offset = 0
-  }
+/** One database call. Null when the function does not exist (PostgREST 404 PGRST202), so the caller can fall back. */
+const rpc: Rpc = async (fnName, body) => {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
     method: 'POST',
     headers: {
@@ -44,41 +41,17 @@ async function fetchRpc(fnName: string, limit: number, cursor: string | null): P
     },
     body: JSON.stringify(body),
   })
+  if (res.status === 404) {
+    const text = await res.text()
+    if (text.includes('PGRST202')) return null
+    throw new Error(`RPC ${fnName} error: 404 ${text}`)
+  }
   // Throw rather than return []: an empty page ends pagination, so a failed
   // call would publish a truncated or empty blocklist.
   if (!res.ok) {
     throw new Error(`RPC ${fnName} error: ${res.status} ${await res.text()}`)
   }
   return await res.json()
-}
-
-async function fetchAll(fnName: string): Promise<any[]> {
-  const all: any[] = []
-  let cursor: string | null = null
-  let hasMore = true
-  while (hasMore) {
-    const t0 = Date.now()
-    const chunk = await fetchRpc(fnName, CHUNK_SIZE, cursor)
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(1)
-    const total = all.length + chunk.length
-    console.log(`  ${fnName}: got ${chunk.length} rows (total ${total}, ${elapsed}s)`)
-    all.push(...chunk)
-    hasMore = chunk.length === CHUNK_SIZE
-    if (chunk.length > 0) {
-      cursor = chunk[chunk.length - 1].entity_value
-    }
-  }
-  return all
-}
-
-function normalizePhone(phone: string): string | null {
-  let d = phone.replace(/[^\d+]/g, '')
-  if (d.startsWith('+84')) d = '0' + d.slice(3)
-  else if (d.startsWith('84') && d.length === 11) d = '0' + d.slice(2)
-  if (/^0\d{9}$/.test(d)) return d
-  if (/^\+\d{7,15}$/.test(d)) return d
-  if (/^\d{7,15}$/.test(d)) return d
-  return null
 }
 
 async function gzipCompress(data: Uint8Array): Promise<Uint8Array> {
@@ -164,48 +137,16 @@ async function uploadJson(bucket: string, path: string, obj: unknown) {
 }
 
 async function main() {
-  console.log('Fetching phones...')
-  const rawPhones = await fetchAll('get_phone_blacklist')
-  console.log(`  Got ${rawPhones.length} phone rows`)
+  console.log('Fetching blocklist rows...')
+  const t0 = Date.now()
+  const rows = await fetchBlocklistRows(rpc, (line) => console.log(line))
+  console.log(`  ${rows.method}: ${rows.phones.length} phone rows, ${rows.domains.length} domain rows, ${rows.calls} calls, ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 
-  // Dedup phones
-  const phoneMap = new Map<string, PhoneEntry>()
-  for (const row of rawPhones) {
-    const num = normalizePhone(row.entity_value)
-    if (!num) continue
-    const existing = phoneMap.get(num)
-    if (!existing || (row.risk_score ?? 0) > existing.r) {
-      phoneMap.set(num, {
-        p: num,
-        n: row.name || null,
-        c: row.category || 'scam',
-        r: row.risk_score ?? 50,
-      })
-    }
-  }
-  const phones = Array.from(phoneMap.values())
-  console.log(`  Deduped to ${phones.length} phones`)
+  const phones = buildPhoneEntries(rows.phones)
+  console.log(`  Kept ${phones.length} blocking phones`)
 
-  console.log('Fetching domains...')
-  const rawDomains = await fetchAll('get_domain_blacklist')
-  console.log(`  Got ${rawDomains.length} domain rows`)
-
-  // Dedup domains
-  const domainMap = new Map<string, DomainEntry>()
-  for (const row of rawDomains) {
-    const domain = (row.entity_value || '').trim().toLowerCase()
-    if (!domain || !domain.includes('.') || domain.length < 4) continue
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(domain)) continue // skip IPs
-    if (!domainMap.has(domain)) {
-      domainMap.set(domain, {
-        d: domain,
-        c: row.category || 'phishing',
-        s: row.source || null,
-      })
-    }
-  }
-  const domains = Array.from(domainMap.values())
-  console.log(`  Deduped to ${domains.length} domains`)
+  const domains = buildDomainEntries(rows.domains)
+  console.log(`  Kept ${domains.length} blocking domains`)
 
   // Never replace the published files with an empty list.
   if (phones.length === 0 || domains.length === 0) {

@@ -59,8 +59,8 @@ jobs:
       - name: Import Phishing.Database links (largest, ~65MB)
         run: deno run --allow-net --allow-env scripts/import-phishing-links.ts
         timeout-minutes: 60
-      - name: Test HaGeZi TIF importer
-        run: deno test scripts/import-hagezi-tif_test.ts
+      - name: Test HaGeZi TIF importer and feed delta
+        run: deno test scripts/import-hagezi-tif_test.ts scripts/feed-delta_test.ts
       - name: Import HaGeZi TIF domains (~2.1M)
         id: sync_hagezi
         continue-on-error: true

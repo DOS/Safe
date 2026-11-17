@@ -12,6 +12,8 @@
  *   SUPABASE_SERVICE_ROLE_KEY  - service role key for RPC calls
  */
 
+import { planDelta, startRun, storageDeltaStore } from "./feed-delta.ts";
+
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const SOURCE = "scamsniffer_domains";
@@ -80,7 +82,7 @@ try {
   const uniqueDomains = [...new Set(domains.map((d: string) => d.toLowerCase()))];
   console.log(`ScamSniffer: ${domains.length} blacklist domains → ${uniqueDomains.length} unique`);
 
-  const entries = uniqueDomains.map((domain) => ({
+  const feedEntries = uniqueDomains.map((domain) => ({
     entity_type: "domain",
     entity_value: domain,
     source: "scamsniffer",
@@ -88,6 +90,12 @@ try {
     risk_score: 85,
     raw_data: { list: "blacklist" },
   }));
+
+  // Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
+  const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
+  const plan = await planDelta(feedEntries, await deltaStore.load("scamsniffer_domains"), Date.now());
+  const entries = await startRun(deltaStore, "scamsniffer_domains", plan, feedEntries);
+  console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 
   let totalAdded = 0;
 
@@ -140,6 +148,7 @@ try {
   }
 
   console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
+  if (feedEntries.length > 0 && totalAdded === entries.length) await deltaStore.save("scamsniffer_domains", plan.next);
   await logFinish(logId, "success", entries.length, totalAdded);
 } catch (e) {
   const msg = e instanceof Error ? e.message : String(e);
@@ -147,4 +156,3 @@ try {
   await logFinish(logId, "failed", 0, 0, msg);
   Deno.exit(1);
 }
-
