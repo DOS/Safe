@@ -14,7 +14,7 @@
  */
 
 import { parseTifDomains, TIF_URL } from "./hagezi-tif.ts";
-import { planDelta, storageDeltaStore } from "./feed-delta.ts";
+import { planDelta, startRun, storageDeltaStore } from "./feed-delta.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -48,7 +48,7 @@ const feedEntries = uniqueDomains.map((domain) => ({
 // Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
 const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
 const plan = await planDelta(feedEntries, await deltaStore.load("hagezi_tif"), Date.now());
-const entries = plan.entries;
+const entries = await startRun(deltaStore, "hagezi_tif", plan, feedEntries);
 console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 
 let totalAdded = 0;

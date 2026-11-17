@@ -10,7 +10,9 @@
 // whose fingerprint the last complete run did not have (new, changed, or listed again); once
 // FULL_SEND_EVERY_MS has passed since the last full send, or when no state is stored, it sends the
 // whole feed. The state (the fingerprints and the time of the last full send) is saved only after a
-// run that stored every row, so a failed or partial run is simply repeated against the older state.
+// run that stored every row. Before a run writes anything, the saved state is removed (startRun), so a
+// run that stops half-way, or whose state upload fails, is followed by a full send: the fingerprints
+// never describe rows the database no longer has.
 // Entries that leave the feed are not touched, as before; they age out on the existing schedule.
 //
 // Why a full send at least every 6 days: bulk_upsert_threats refreshes a row's last_seen_at only
@@ -109,8 +111,20 @@ export function parseState(value: unknown): DeltaState | null {
 export interface DeltaStore {
   /** The saved state, or null when there is none or it cannot be read (the run then sends everything). */
   load(feed: string): Promise<DeltaState | null>
-  /** Saves the state; false when it could not (the next run then repeats against the older state). */
+  /** Saves the state; false when it could not (the next run is then a full send). */
   save(feed: string, state: DeltaState): Promise<boolean>
+  /** Removes the state (true also when there was none); false when that failed. */
+  clear(feed: string): Promise<boolean>
+}
+
+/**
+ * The entries to send, once the saved state is gone: a run that stops half-way must not leave
+ * fingerprints of rows it changed only in part. When the state cannot be removed, everything is sent.
+ */
+export async function startRun<T>(store: DeltaStore, feed: string, plan: DeltaPlan<T>, all: T[]): Promise<T[]> {
+  if (await store.clear(feed)) return plan.entries
+  console.warn(`feed-delta: state for ${feed} could not be cleared, sending the whole feed`)
+  return all
 }
 
 async function gzip(text: string): Promise<Blob> {
@@ -151,6 +165,17 @@ export function storageDeltaStore(opts: {
       } catch (e) {
         console.warn(`feed-delta: state for ${feed} unreadable: ${e instanceof Error ? e.message : e}`)
         return null
+      }
+    },
+    async clear(feed) {
+      try {
+        const res = await doFetch(objectUrl(feed), { method: 'DELETE', headers, signal: AbortSignal.timeout(timeoutMs) })
+        await res.body?.cancel()
+        // Storage answers 400 or 404 for an object (or a bucket) that does not exist.
+        return res.ok || res.status === 400 || res.status === 404
+      } catch (e) {
+        console.warn(`feed-delta: state for ${feed} not cleared: ${e instanceof Error ? e.message : e}`)
+        return false
       }
     },
     async save(feed, state) {

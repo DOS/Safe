@@ -4,6 +4,7 @@ import {
   fingerprintOf,
   parseState,
   planDelta,
+  startRun,
   stableJson,
   storageDeltaStore,
 } from './feed-delta.ts'
@@ -86,6 +87,9 @@ Deno.test('storageDeltaStore saves gzip JSON and loads it back; a missing object
   const objects = new Map<string, Uint8Array>()
   const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
+    if (init?.method === 'DELETE') {
+      return new Response('{}', { status: objects.delete(url) ? 200 : 400 })
+    }
     if (init?.method === 'POST') {
       objects.set(url, new Uint8Array(await new Response(init.body).arrayBuffer()))
       return new Response('{}', { status: 200 })
@@ -99,6 +103,22 @@ Deno.test('storageDeltaStore saves gzip JSON and loads it back; a missing object
   assertEquals(await store.save('watchlist_internet', state), true)
   assertEquals([...objects.keys()], ['https://db.example/storage/v1/object/dosafe-feed-state/watchlist_internet.json.gz'])
   assertEquals(await store.load('watchlist_internet'), state)
+  assertEquals(await store.clear('watchlist_internet'), true)
+  assertEquals(await store.load('watchlist_internet'), null)
+  // Clearing a state that is not there is fine.
+  assertEquals(await store.clear('watchlist_internet'), true)
+})
+
+Deno.test('startRun removes the state before writing; when it cannot, the whole feed is sent', async () => {
+  const lastFull = new Date(NOW - 86_400_000).toISOString()
+  const plan = await planDelta([a, b, c], await stateOf([a, b], lastFull), NOW)
+  assertEquals(plan.entries, [c])
+  const cleared: string[] = []
+  const ok = { load: () => Promise.resolve(null), save: () => Promise.resolve(true), clear: (f: string) => { cleared.push(f); return Promise.resolve(true) } }
+  assertEquals(await startRun(ok, 'feed', plan, [a, b, c]), [c])
+  assertEquals(cleared, ['feed'])
+  const stuck = { ...ok, clear: () => Promise.resolve(false) }
+  assertEquals(await startRun(stuck, 'feed', plan, [a, b, c]), [a, b, c])
 })
 
 Deno.test('storageDeltaStore treats an unreadable object or a failed call as no state', async () => {
@@ -115,4 +135,5 @@ Deno.test('storageDeltaStore treats an unreadable object or a failed call as no 
   })
   assertEquals(await down.load('f'), null)
   assertEquals(await down.save('f', await stateOf([a], new Date(NOW).toISOString())), false)
+  assertEquals(await down.clear('f'), false)
 })
