@@ -12,6 +12,8 @@
  *   SUPABASE_SERVICE_ROLE_KEY  - service role key for RPC calls
  */
 
+import { planDelta, storageDeltaStore } from "./feed-delta.ts";
+
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
@@ -37,7 +39,7 @@ const uniqueUrls = [...new Set(lines.map((l) => l.trim().toLowerCase()))];
 console.log(`Parsed ${lines.length} phishing links → ${uniqueUrls.length} unique`);
 
 // Build entries
-const entries = uniqueUrls.map((url) => ({
+const feedEntries = uniqueUrls.map((url) => ({
   entity_type: "url",
   entity_value: url,
   source: "phishing_database",
@@ -45,6 +47,12 @@ const entries = uniqueUrls.map((url) => ({
   risk_score: 85,
   raw_data: {},
 }));
+
+// Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
+const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
+const plan = planDelta(feedEntries, await deltaStore.load("phishing_database_links"), Date.now());
+const entries = plan.entries;
+console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 
 let totalAdded = 0;
 
@@ -96,4 +104,4 @@ for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
 }
 
 console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
-
+if (feedEntries.length > 0 && totalAdded === entries.length) await deltaStore.save("phishing_database_links", plan.next);

@@ -13,7 +13,8 @@
  *   SUPABASE_SERVICE_ROLE_KEY  - service role key for RPC calls
  */
 
-import { isCompleteUpload, parseTifDomains, TIF_URL } from "./hagezi-tif.ts";
+import { parseTifDomains, TIF_URL } from "./hagezi-tif.ts";
+import { planDelta, storageDeltaStore } from "./feed-delta.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -35,7 +36,7 @@ const uniqueDomains = parseTifDomains(await res.text());
 console.log(`Parsed ${uniqueDomains.length} unique domains`);
 
 // Build entries
-const entries = uniqueDomains.map((domain) => ({
+const feedEntries = uniqueDomains.map((domain) => ({
   entity_type: "domain",
   entity_value: domain,
   source: "hagezi_tif",
@@ -43,6 +44,12 @@ const entries = uniqueDomains.map((domain) => ({
   risk_score: 80,
   raw_data: {},
 }));
+
+// Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
+const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
+const plan = planDelta(feedEntries, await deltaStore.load("hagezi_tif"), Date.now());
+const entries = plan.entries;
+console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 
 let totalAdded = 0;
 
@@ -106,7 +113,9 @@ for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
 }
 
 console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
-const uploadComplete = isCompleteUpload(totalAdded, entries.length);
+// Complete when the feed was not empty and every entry sent was stored (a delta run may send none).
+const uploadComplete = feedEntries.length > 0 && totalAdded === entries.length;
+if (uploadComplete) await deltaStore.save("hagezi_tif", plan.next);
 
 // Write to sync_log for health monitoring
 // After source consolidation, HaGeZi TIF is the sole domain source — monitoring is critical.
@@ -146,4 +155,3 @@ try {
 if (!uploadComplete) {
   throw new Error(`Incomplete HaGeZi upload: ${totalAdded}/${entries.length}`);
 }
-
