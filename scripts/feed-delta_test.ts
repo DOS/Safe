@@ -27,6 +27,7 @@ async function stateOf(entries: unknown[], lastFullAt: string): Promise<DeltaSta
 
 Deno.test('stableJson ignores key order and undefined values', async () => {
   assertEquals(stableJson({ b: 1, a: { d: [1, { z: 1, y: 2 }], c: undefined } }), '{"a":{"d":[1,{"y":2,"z":1}]},"b":1}')
+  assertEquals(stableJson({ at: new Date('2026-11-17T00:00:00Z') }), '{"at":"2026-11-17T00:00:00.000Z"}')
   assertEquals(await fingerprintOf({ x: 1, y: 'v' }), await fingerprintOf({ y: 'v', x: 1 }))
   // The first 64 bits of SHA-256("{\"x\":1}").
   assertEquals(await fingerprintOf({ x: 1 }), '5041bf1f713df204')

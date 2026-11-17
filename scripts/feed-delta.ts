@@ -47,6 +47,9 @@ export interface DeltaPlan<T> {
 /** JSON with object keys sorted, so two equal entries always give the same text. */
 export function stableJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  // As JSON.stringify does: a Date (or any object with toJSON) is written as what toJSON returns.
+  const withToJson = value as { toJSON?: () => unknown }
+  if (typeof withToJson.toJSON === 'function') return stableJson(withToJson.toJSON())
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
   const obj = value as Record<string, unknown>
   const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort()

@@ -39,7 +39,13 @@ export interface BlocklistRows {
   calls: number
 }
 
-function compareRows(a: DomainRow, b: DomainRow): number {
+/** The fields both row kinds share, so one comparison sorts phones and domains. */
+interface SortableRow {
+  entity_value?: string | null
+  source?: string | null
+}
+
+function compareRows(a: SortableRow, b: SortableRow): number {
   const av = String(a.entity_value ?? '')
   const bv = String(b.entity_value ?? '')
   if (av !== bv) return av < bv ? -1 : 1
@@ -95,8 +101,8 @@ export async function fetchBlocklistRows(rpc: Rpc, log: (line: string) => void =
 
 async function fetchByKeyset(rpc: Rpc, log: (line: string) => void): Promise<BlocklistRows> {
   let calls = 1
-  const all = async (fn: string): Promise<DomainRow[]> => {
-    const out: DomainRow[] = []
+  const all = async (fn: string): Promise<BlockRangeRow[]> => {
+    const out: BlockRangeRow[] = []
     let cursor: string | null = null
     while (true) {
       const body: Record<string, unknown> = { p_limit: KEYSET_CHUNK, p_since: null }
@@ -106,10 +112,10 @@ async function fetchByKeyset(rpc: Rpc, log: (line: string) => void): Promise<Blo
       calls++
       // An empty or failed page ends nothing silently: a missing function here is an error.
       if (!Array.isArray(chunk)) throw new Error(`${fn} did not return rows`)
-      out.push(...(chunk as DomainRow[]))
+      out.push(...(chunk as BlockRangeRow[]))
       log(`  ${fn}: got ${chunk.length} rows (total ${out.length})`)
       if (chunk.length < KEYSET_CHUNK) break
-      cursor = String((chunk[chunk.length - 1] as DomainRow).entity_value ?? '')
+      cursor = String((chunk[chunk.length - 1] as BlockRangeRow).entity_value ?? '')
     }
     return out
   }
