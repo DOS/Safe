@@ -1,12 +1,11 @@
 name: Generate Blocklist Files
 
 # Regenerates pre-compressed blocklist files for mobile download.
-# Runs every 6 hours, after Supabase Edge Function cron jobs sync threat data.
-# Also runs after daily scrape completes.
+# Runs after the large-source sync (every 2 days) and after the daily scrape
+# completes. No schedule of its own: a scheduled run an hour after the
+# large-source sync exported the same data a second time and doubled the disk
+# reads the export causes on the shared database (DOS/DOS.AI#7620).
 on:
-  schedule:
-    # Every 6 hours at :30 — offset from sync-threats-6h (which runs at :00)
-    - cron: '30 3 */2 * *'
   workflow_run:
     workflows: ['Daily Scrape (scam.vn + tinnhiemmang)', 'Sync Large Sources']
     types: [completed]
