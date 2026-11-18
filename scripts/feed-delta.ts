@@ -216,12 +216,12 @@ export function rpcFeedLeases(opts: {
   key: string
   timeoutMs?: number
   fetch?: typeof fetch
-  /** Holder id of this run; a new random UUID by default. */
-  holder?: string
+  /** A new holder id for each acquire (a random UUID by default; tests pass a fixed one). */
+  newHolder?: () => string
 }): FeedLeases {
   const doFetch = opts.fetch ?? fetch
   const timeoutMs = opts.timeoutMs ?? 30_000
-  const holder = opts.holder ?? crypto.randomUUID()
+  const newHolder = opts.newHolder ?? (() => crypto.randomUUID())
   const call = (fn: string, args: Record<string, unknown>) =>
     doFetch(`${opts.url}/rest/v1/rpc/${fn}`, {
       method: 'POST',
@@ -238,6 +238,9 @@ export function rpcFeedLeases(opts: {
 
   return {
     async acquire(feed, ttlSeconds) {
+      // One holder per acquire, never per module: an Edge isolate can serve two overlapping runs,
+      // and a shared holder would let the second take the first one's lease.
+      const holder = newHolder()
       const res = await call('acquire_feed_lease', { p_feed: feed, p_holder: holder, p_ttl_seconds: ttlSeconds })
       const text = await res.text()
       if (!res.ok) {

@@ -184,7 +184,11 @@ function leaseServer(answers: Record<string, (args: Record<string, unknown>) => 
     if (!answer) throw new Error(`unexpected call ${fn}`)
     return answer(args)
   }) as typeof fetch
-  return { calls, leases: rpcFeedLeases({ url: 'https://db.example', key: 'k', fetch: fakeFetch, holder: 'h-1' }) }
+  return {
+    calls,
+    leases: rpcFeedLeases({ url: 'https://db.example', key: 'k', fetch: fakeFetch, newHolder: () => 'h-1' }),
+    defaultLeases: rpcFeedLeases({ url: 'https://db.example', key: 'k', fetch: fakeFetch }),
+  }
 }
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status })
@@ -205,6 +209,14 @@ Deno.test('rpcFeedLeases: a free feed is leased, renewed and released by this ho
     { fn: 'renew_feed_lease', args: { p_feed: 'urlhaus', p_holder: 'h-1', p_ttl_seconds: 900 } },
     { fn: 'release_feed_lease', args: { p_feed: 'urlhaus', p_holder: 'h-1' } },
   ])
+})
+
+Deno.test('rpcFeedLeases: every acquire has its own holder, so two runs in one isolate exclude each other', async () => {
+  const { calls, defaultLeases } = leaseServer({ acquire_feed_lease: () => json({ acquired: true }) })
+  await defaultLeases.acquire('urlhaus', 900)
+  await defaultLeases.acquire('urlhaus', 900)
+  const holders = calls.map((c) => c.args.p_holder)
+  assertEquals([typeof holders[0], holders[0] === holders[1]], ['string', false])
 })
 
 Deno.test('rpcFeedLeases: a held feed is reported with its expiry', async () => {
