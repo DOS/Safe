@@ -111,9 +111,13 @@ for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
 }
 
 console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
-// The state is saved while this run still holds the lease (DOS/DOS.AI#7625).
-if (
-  feedEntries.length > 0 && totalAdded === entries.length &&
+if (totalAdded !== entries.length) {
+  // Annotated, not a failed exit: a failed step would skip the HaGeZi TIF import that follows it in
+  // the same job (sync-large-sources.yml). The state is not saved, so the next run sends again.
+  console.log(`::error::phishing_database_links: incomplete upload ${totalAdded}/${entries.length}`);
+} else if (
+  feedEntries.length > 0 &&
+  // The state is saved while this run still holds the lease (DOS/DOS.AI#7625).
   await finishRun(deltaStore, lease, "phishing_database_links", plan.next) === "not_saved"
 ) {
   console.log("::warning::phishing_database_links: all rows stored, but the delta state was not saved: the next runs send the whole feed");

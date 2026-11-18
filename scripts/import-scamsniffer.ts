@@ -162,10 +162,16 @@ try {
   console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
   // Every row stored: the state is saved while this run still holds the lease, and a failed
   // save makes the run partial, which alerts (DOS/DOS.AI#7625).
-  const { status, error } = feedEntries.length > 0 && totalAdded === entries.length
+  const complete = totalAdded === entries.length;
+  const { status, error } = !complete
+    ? { status: "failed", error: `Incomplete upload: ${totalAdded}/${entries.length}` }
+    : feedEntries.length > 0
     ? savedRunStatus(await finishRun(deltaStore, lease, "scamsniffer_domains", plan.next))
     : { status: "success", error: null };
   await logFinish(logId, status, entries.length, totalAdded, error ?? undefined);
+  // An incomplete upload fails the job (it used to be logged as a success); the script still
+  // ends normally, so the lease is released.
+  if (!complete) Deno.exitCode = 1;
 } catch (e) {
   const msg = e instanceof Error ? e.message : String(e);
   console.error(`Fatal error: ${msg}`);
