@@ -150,8 +150,11 @@ export async function startRun<T>(store: DeltaStore, feed: string, plan: DeltaPl
 export interface FeedLease {
   /** False when the database has no lease functions yet: the run goes on without a lease. */
   readonly supported: boolean
-  /** Extends the lease; false when this run no longer holds it (or the call failed). */
-  renew(): Promise<boolean>
+  /**
+   * Extends the lease: 'held' when it did, 'lost' when this run no longer holds it, 'error' when
+   * the call failed (whether the run still holds it is then unknown).
+   */
+  renew(): Promise<'held' | 'lost' | 'error'>
   /** Gives the lease back; a failure only logs (the lease then expires on its own). */
   release(): Promise<void>
 }
@@ -170,14 +173,34 @@ export async function finishRun(
   feed: string,
   next: DeltaState,
 ): Promise<'saved' | 'not_saved' | 'lease_lost'> {
-  if (!(await lease.renew())) {
+  const renewed = await lease.renew()
+  if (renewed === 'lost') {
+    // Another run took the feed and saves its own state: not an error of this run.
     console.warn(`feed-delta: the lease on ${feed} was lost before the save; the state is not saved`)
     return 'lease_lost'
+  }
+  if (renewed === 'error') {
+    // Not known to be held: do not save, and report it like a failed save (it alerts).
+    console.warn(`feed-delta: the lease on ${feed} could not be renewed; the state is not saved`)
+    return 'not_saved'
   }
   return (await store.save(feed, next)) ? 'saved' : 'not_saved'
 }
 
-const NO_LEASE: FeedLease = { supported: false, renew: async () => true, release: async () => {} }
+const NO_LEASE: FeedLease = { supported: false, renew: async () => 'held', release: async () => {} }
+
+/** How often a script renews its lease while it sends, and how long before expiry it gives up. */
+export const SCRIPT_LEASE_RENEW_EVERY_MS = 5 * 60 * 1000
+const SCRIPT_LEASE_MARGIN_MS = 5 * 60 * 1000
+
+export interface ScriptFeedLease extends FeedLease, AsyncDisposable {
+  /**
+   * Call before each chunk it sends: renews the lease every few minutes, and throws when the run
+   * no longer holds it, or cannot show it does before it expires. A run that outlived its lease
+   * must stop writing: another run may have taken the feed and saved newer fingerprints.
+   */
+  ensure(): Promise<void>
+}
 
 /**
  * For an import script: the feed's lease, released when the `await using` scope ends (also when
@@ -188,18 +211,34 @@ export async function scriptFeedLease(
   leases: FeedLeases,
   feed: string,
   ttlSeconds: number,
-): Promise<(FeedLease & AsyncDisposable) | null> {
+  opts: { now?: () => number } = {},
+): Promise<ScriptFeedLease | null> {
+  const now = opts.now ?? Date.now
   const leased = await leases.acquire(feed, ttlSeconds)
   if (!leased.held) {
     console.log(`::notice::${feed}: another run holds its lease (until ${leased.until ?? 'unknown'}); nothing to do`)
     return null
   }
   const lease = leased.lease
+  let heldAt = now()
   return {
     supported: lease.supported,
     renew: () => lease.renew(),
     release: () => lease.release(),
     [Symbol.asyncDispose]: () => lease.release(),
+    async ensure() {
+      if (now() - heldAt < SCRIPT_LEASE_RENEW_EVERY_MS) return
+      const renewed = await lease.renew()
+      if (renewed === 'held') {
+        heldAt = now()
+        return
+      }
+      if (renewed === 'lost') throw new Error(`feed lease for ${feed} lost: another run took the feed`)
+      // A failed call: go on while the lease last confirmed is still clearly valid.
+      if (now() - heldAt > ttlSeconds * 1000 - SCRIPT_LEASE_MARGIN_MS) {
+        throw new Error(`feed lease for ${feed} could not be renewed before it expires`)
+      }
+    },
   }
 }
 
@@ -263,10 +302,17 @@ export function rpcFeedLeases(opts: {
             try {
               const r = await call('renew_feed_lease', { p_feed: feed, p_holder: holder, p_ttl_seconds: ttlSeconds })
               const t = await r.text()
-              return r.ok && JSON.parse(t) === true
+              if (!r.ok) {
+                console.warn(`feed-delta: lease on ${feed} not renewed (HTTP ${r.status})`)
+                return 'error'
+              }
+              const v = JSON.parse(t)
+              if (v === true) return 'held'
+              if (v === false) return 'lost'
+              return 'error'
             } catch (e) {
               console.warn(`feed-delta: lease on ${feed} not renewed: ${e instanceof Error ? e.message : e}`)
-              return false
+              return 'error'
             }
           },
           async release() {

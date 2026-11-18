@@ -8,6 +8,7 @@ import {
   parseState,
   planDelta,
   rpcFeedLeases,
+  SCRIPT_LEASE_RENEW_EVERY_MS,
   savedRunStatus,
   scriptFeedLease,
   startRun,
@@ -202,7 +203,7 @@ Deno.test('rpcFeedLeases: a free feed is leased, renewed and released by this ho
   const r = await leases.acquire('urlhaus', 900)
   if (!r.held) throw new Error('expected the lease')
   assertEquals(r.lease.supported, true)
-  assertEquals(await r.lease.renew(), true)
+  assertEquals(await r.lease.renew(), 'held')
   await r.lease.release()
   assertEquals(calls, [
     { fn: 'acquire_feed_lease', args: { p_feed: 'urlhaus', p_holder: 'h-1', p_ttl_seconds: 900 } },
@@ -228,7 +229,7 @@ Deno.test('rpcFeedLeases: without the lease functions the run goes on unprotecte
   const missing = leaseServer({ acquire_feed_lease: () => json({ code: 'PGRST202', message: 'Could not find the function' }, 404) })
   const r = await missing.leases.acquire('urlhaus', 900)
   if (!r.held) throw new Error('expected a lease stand-in')
-  assertEquals([r.lease.supported, await r.lease.renew()], [false, true])
+  assertEquals([r.lease.supported, await r.lease.renew()], [false, 'held'])
   await r.lease.release()
   assertEquals(missing.calls.length, 1)
 
@@ -242,15 +243,15 @@ Deno.test('rpcFeedLeases: without the lease functions the run goes on unprotecte
   assertEquals(threw, true)
 })
 
-Deno.test('rpcFeedLeases: a lost lease or a failed renewal is not a renewal', async () => {
+Deno.test('rpcFeedLeases: a lost lease and a failed renewal are told apart', async () => {
   const lost = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), renew_feed_lease: () => json(false) })
   const r = await lost.leases.acquire('urlhaus', 900)
   if (!r.held) throw new Error('expected the lease')
-  assertEquals(await r.lease.renew(), false)
+  assertEquals(await r.lease.renew(), 'lost')
   const failing = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), renew_feed_lease: () => json({}, 500) })
   const f = await failing.leases.acquire('urlhaus', 900)
   if (!f.held) throw new Error('expected the lease')
-  assertEquals(await f.lease.renew(), false)
+  assertEquals(await f.lease.renew(), 'error')
 })
 
 Deno.test('finishRun saves only while the lease is held', async () => {
@@ -260,13 +261,15 @@ Deno.test('finishRun saves only while the lease is held', async () => {
     save: (f: string) => { saved.push(f); return Promise.resolve(true) },
     clear: () => Promise.resolve(true),
   }
-  const lease = (held: boolean): FeedLease => ({ supported: true, renew: () => Promise.resolve(held), release: () => Promise.resolve() })
+  const lease = (r: 'held' | 'lost' | 'error'): FeedLease => ({ supported: true, renew: () => Promise.resolve(r), release: () => Promise.resolve() })
   const next = await stateOf([a], new Date(NOW).toISOString())
-  assertEquals(await finishRun(store, lease(false), 'feed', next), 'lease_lost')
+  assertEquals(await finishRun(store, lease('lost'), 'feed', next), 'lease_lost')
+  // A failed renewal: not known to be held, so no save, and reported like a failed save (it alerts).
+  assertEquals(await finishRun(store, lease('error'), 'feed', next), 'not_saved')
   assertEquals(saved, [])
-  assertEquals(await finishRun(store, lease(true), 'feed', next), 'saved')
+  assertEquals(await finishRun(store, lease('held'), 'feed', next), 'saved')
   assertEquals(saved, ['feed'])
-  assertEquals(await finishRun({ ...store, save: () => Promise.resolve(false) }, lease(true), 'feed', next), 'not_saved')
+  assertEquals(await finishRun({ ...store, save: () => Promise.resolve(false) }, lease('held'), 'feed', next), 'not_saved')
 })
 
 Deno.test('savedRunStatus: a failed save makes the run partial, which alerts', () => {
@@ -302,4 +305,45 @@ Deno.test('storageDeltaStore treats an unreadable object or a failed call as no 
   assertEquals(await down.load('f'), null)
   assertEquals(await down.save('f', await stateOf([a], new Date(NOW).toISOString())), false)
   assertEquals(await down.clear('f'), false)
+})
+
+Deno.test('scriptFeedLease.ensure renews every few minutes and stops a run that lost the feed', async () => {
+  let clock = 0
+  let answer: () => Response = () => json(true)
+  const server = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), renew_feed_lease: () => answer() })
+  const lease = await scriptFeedLease(server.leases, 'hagezi_tif', 5400, { now: () => clock })
+  if (!lease) throw new Error('expected the lease')
+  const renewals = () => server.calls.filter((c) => c.fn === 'renew_feed_lease').length
+  const throws = async () => {
+    try {
+      await lease.ensure()
+      return false
+    } catch {
+      return true
+    }
+  }
+  await lease.ensure()
+  assertEquals(renewals(), 0)
+  clock = SCRIPT_LEASE_RENEW_EVERY_MS
+  await lease.ensure()
+  assertEquals(renewals(), 1)
+  // A failed call while the lease is still clearly valid: the run goes on.
+  answer = () => json({}, 503)
+  clock += SCRIPT_LEASE_RENEW_EVERY_MS
+  assertEquals(await throws(), false)
+  // Too close to the expiry without a confirmed renewal: the run stops.
+  clock = SCRIPT_LEASE_RENEW_EVERY_MS + 5400 * 1000 - 60_000
+  assertEquals(await throws(), true)
+  // Another run took the feed: the run stops at once.
+  answer = () => json(false)
+  clock = 0
+  const fresh = await scriptFeedLease(server.leases, 'hagezi_tif', 5400, { now: () => clock })
+  clock = SCRIPT_LEASE_RENEW_EVERY_MS
+  let stopped = false
+  try {
+    await fresh!.ensure()
+  } catch {
+    stopped = true
+  }
+  assertEquals(stopped, true)
 })

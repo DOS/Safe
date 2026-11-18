@@ -105,6 +105,8 @@ try {
   let totalAdded = 0;
 
   for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+    // Stop writing if this run no longer holds the feed (DOS/DOS.AI#7625).
+    await lease.ensure();
     const chunk = entries.slice(i, i + CHUNK_SIZE);
     const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
     const totalChunks = Math.ceil(entries.length / CHUNK_SIZE);
