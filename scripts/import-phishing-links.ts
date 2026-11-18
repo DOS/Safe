@@ -12,7 +12,7 @@
  *   SUPABASE_SERVICE_ROLE_KEY  - service role key for RPC calls
  */
 
-import { planDelta, startRun, storageDeltaStore } from "./feed-delta.ts";
+import { finishRun, planDelta, rpcFeedLeases, scriptFeedLease, startRun, storageDeltaStore } from "./feed-delta.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -21,6 +21,11 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("Missing required env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
   Deno.exit(1);
 }
+
+// One run of this feed at a time (DOS/DOS.AI#7625): the lease lasts the job's timeout and is
+// released when the script ends, also when it throws.
+await using lease = await scriptFeedLease(rpcFeedLeases({ url: SUPABASE_URL, key: SUPABASE_KEY }), "phishing_database_links", 60 * 60);
+if (!lease) Deno.exit(0);
 
 const LINKS_URL = "https://raw.githubusercontent.com/Phishing-Database/Phishing.Database/master/phishing-links-ACTIVE.txt";
 const CHUNK_SIZE = 5000;
@@ -51,7 +56,7 @@ const feedEntries = uniqueUrls.map((url) => ({
 // Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
 const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
 const plan = await planDelta(feedEntries, await deltaStore.load("phishing_database_links"), Date.now());
-const entries = await startRun(deltaStore, "phishing_database_links", plan, feedEntries);
+const entries = await startRun(deltaStore, "phishing_database_links", plan);
 console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 
 let totalAdded = 0;
@@ -104,4 +109,10 @@ for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
 }
 
 console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
-if (feedEntries.length > 0 && totalAdded === entries.length) await deltaStore.save("phishing_database_links", plan.next);
+// The state is saved while this run still holds the lease (DOS/DOS.AI#7625).
+if (
+  feedEntries.length > 0 && totalAdded === entries.length &&
+  await finishRun(deltaStore, lease, "phishing_database_links", plan.next) === "not_saved"
+) {
+  console.log("::warning::phishing_database_links: all rows stored, but the delta state was not saved: the next runs send the whole feed");
+}

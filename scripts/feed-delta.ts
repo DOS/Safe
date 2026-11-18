@@ -1,6 +1,6 @@
 // Send only what changed in a full-list feed since its last complete run (DOS/DOS.AI#7620).
 //
-// Copy of DOS/DOSafe supabase/functions/_shared/feed-delta.ts; keep the two equal.
+// Copy of the DOSafe feed-delta module that DOSafe's own importers use; keep the two equal.
 //
 // Why: every entry sent to dosafe.bulk_upsert_threats costs random disk reads on the database (an
 // index probe plus the stored row), even when nothing changes; the churn guard skips the write but
@@ -10,9 +10,10 @@
 // whose fingerprint the last complete run did not have (new, changed, or listed again); once
 // FULL_SEND_EVERY_MS has passed since the last full send, or when no state is stored, it sends the
 // whole feed. The state (the fingerprints and the time of the last full send) is saved only after a
-// run that stored every row. Before a run writes anything, the saved state is removed (startRun), so a
-// run that stops half-way, or whose state upload fails, is followed by a full send: the fingerprints
-// never describe rows the database no longer has.
+// run that stored every row. Before a run writes anything, the saved state is removed, or overwritten
+// with a tombstone when it cannot be removed (startRun), so a run that stops half-way, or whose state
+// upload fails, is followed by a full send: the fingerprints never describe rows the database no
+// longer has. One run of a feed at a time holds the feed's lease (rpcFeedLeases, finishRun).
 // Entries that leave the feed are not touched, as before; they age out on the existing schedule.
 //
 // Why a full send at least every 6 days: bulk_upsert_threats refreshes a row's last_seen_at only
@@ -118,13 +119,166 @@ export interface DeltaStore {
 }
 
 /**
- * The entries to send, once the saved state is gone: a run that stops half-way must not leave
- * fingerprints of rows it changed only in part. When the state cannot be removed, everything is sent.
+ * A state that describes nothing and asks for a full send (its last full send is long past). It
+ * stands in for a removed state when the removal fails (DOS/DOS.AI#7625).
  */
-export async function startRun<T>(store: DeltaStore, feed: string, plan: DeltaPlan<T>, all: T[]): Promise<T[]> {
+export const TOMBSTONE_STATE: DeltaState = { v: STATE_VERSION, lastFullAt: new Date(0).toISOString(), fingerprints: [] }
+
+/**
+ * The entries to send, once the saved state is gone: a run that stops half-way must not leave
+ * fingerprints of rows it changed only in part. When the state cannot be removed it is overwritten
+ * with TOMBSTONE_STATE; when neither works the run must not write at all (it throws), because a
+ * later delta run would trust the old fingerprints for rows this run changed.
+ */
+export async function startRun<T>(store: DeltaStore, feed: string, plan: DeltaPlan<T>): Promise<T[]> {
   if (await store.clear(feed)) return plan.entries
-  console.warn(`feed-delta: state for ${feed} could not be cleared, sending the whole feed`)
-  return all
+  console.warn(`feed-delta: state for ${feed} could not be removed, overwriting it with a tombstone`)
+  if (await store.save(feed, TOMBSTONE_STATE)) return plan.entries
+  throw new Error(`feed-delta: state for ${feed} can be neither removed nor overwritten; nothing sent`)
+}
+
+// ─── One run of a feed at a time (DOS/DOS.AI#7625) ───
+//
+// Two runs of one feed can overlap (pg_cron starts sync-threats-6h and retry-failed-syncs at the
+// same minute; a manual `?sources=` call or workflow dispatch can start during a scheduled run).
+// Each removes the state, sends, and saves its own fingerprints; the later save may describe values
+// the other run overwrote. A run therefore takes the feed's lease (the database function
+// dosafe.acquire_feed_lease) before it touches the state, saves the state only while it still holds
+// the lease (finishRun), and releases it at the end. A run that finds the lease held skips the feed.
+// Until the lease functions exist in the database, runs go on without a lease, as before.
+
+export interface FeedLease {
+  /** False when the database has no lease functions yet: the run goes on without a lease. */
+  readonly supported: boolean
+  /** Extends the lease; false when this run no longer holds it (or the call failed). */
+  renew(): Promise<boolean>
+  /** Gives the lease back; a failure only logs (the lease then expires on its own). */
+  release(): Promise<void>
+}
+
+export type LeaseResult = { held: true; lease: FeedLease } | { held: false; until: string | null }
+
+export interface FeedLeases {
+  /** Throws when the database cannot answer: the run must not go on unprotected. */
+  acquire(feed: string, ttlSeconds: number): Promise<LeaseResult>
+}
+
+/** Saves the state only while the run still holds the feed's lease. */
+export async function finishRun(
+  store: DeltaStore,
+  lease: FeedLease,
+  feed: string,
+  next: DeltaState,
+): Promise<'saved' | 'not_saved' | 'lease_lost'> {
+  if (!(await lease.renew())) {
+    console.warn(`feed-delta: the lease on ${feed} was lost before the save; the state is not saved`)
+    return 'lease_lost'
+  }
+  return (await store.save(feed, next)) ? 'saved' : 'not_saved'
+}
+
+const NO_LEASE: FeedLease = { supported: false, renew: async () => true, release: async () => {} }
+
+/**
+ * For an import script: the feed's lease, released when the `await using` scope ends (also when
+ * the script throws), or null after a notice when another run holds it. ttlSeconds should be the
+ * job's timeout, so the lease of a run that is killed does not outlive it.
+ */
+export async function scriptFeedLease(
+  leases: FeedLeases,
+  feed: string,
+  ttlSeconds: number,
+): Promise<(FeedLease & AsyncDisposable) | null> {
+  const leased = await leases.acquire(feed, ttlSeconds)
+  if (!leased.held) {
+    console.log(`::notice::${feed}: another run holds its lease (until ${leased.until ?? 'unknown'}); nothing to do`)
+    return null
+  }
+  const lease = leased.lease
+  return {
+    supported: lease.supported,
+    renew: () => lease.renew(),
+    release: () => lease.release(),
+    [Symbol.asyncDispose]: () => lease.release(),
+  }
+}
+
+/** sync_log status and error of an import that stored every row it sent, by the result of its save. */
+export function savedRunStatus(save: 'saved' | 'not_saved' | 'lease_lost'): { status: 'success' | 'partial'; error: string | null } {
+  return save === 'not_saved'
+    ? { status: 'partial', error: 'all rows stored, but the delta state was not saved: the next runs send the whole feed' }
+    : { status: 'success', error: null }
+}
+
+/** Leases kept by the dosafe lease functions, called through PostgREST. */
+export function rpcFeedLeases(opts: {
+  url: string
+  key: string
+  timeoutMs?: number
+  fetch?: typeof fetch
+  /** Holder id of this run; a new random UUID by default. */
+  holder?: string
+}): FeedLeases {
+  const doFetch = opts.fetch ?? fetch
+  const timeoutMs = opts.timeoutMs ?? 30_000
+  const holder = opts.holder ?? crypto.randomUUID()
+  const call = (fn: string, args: Record<string, unknown>) =>
+    doFetch(`${opts.url}/rest/v1/rpc/${fn}`, {
+      method: 'POST',
+      headers: {
+        apikey: opts.key,
+        Authorization: `Bearer ${opts.key}`,
+        'Content-Type': 'application/json',
+        'Content-Profile': 'dosafe',
+        'Accept-Profile': 'dosafe',
+      },
+      body: JSON.stringify(args),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+
+  return {
+    async acquire(feed, ttlSeconds) {
+      const res = await call('acquire_feed_lease', { p_feed: feed, p_holder: holder, p_ttl_seconds: ttlSeconds })
+      const text = await res.text()
+      if (!res.ok) {
+        // PGRST202: no such function in the schema cache, i.e. the migration is not applied yet.
+        if (res.status === 404 && /PGRST202/.test(text)) {
+          console.warn(`feed-delta: no lease functions in the database; ${feed} runs without a lease`)
+          return { held: true, lease: NO_LEASE }
+        }
+        throw new Error(`feed lease for ${feed}: HTTP ${res.status}`)
+      }
+      const body = JSON.parse(text) as { acquired?: unknown; expires_at?: unknown }
+      if (body.acquired !== true) {
+        return { held: false, until: typeof body.expires_at === 'string' ? body.expires_at : null }
+      }
+      return {
+        held: true,
+        lease: {
+          supported: true,
+          async renew() {
+            try {
+              const r = await call('renew_feed_lease', { p_feed: feed, p_holder: holder, p_ttl_seconds: ttlSeconds })
+              const t = await r.text()
+              return r.ok && JSON.parse(t) === true
+            } catch (e) {
+              console.warn(`feed-delta: lease on ${feed} not renewed: ${e instanceof Error ? e.message : e}`)
+              return false
+            }
+          },
+          async release() {
+            try {
+              const r = await call('release_feed_lease', { p_feed: feed, p_holder: holder })
+              await r.body?.cancel()
+              if (!r.ok) console.warn(`feed-delta: lease on ${feed} not released (HTTP ${r.status}); it expires on its own`)
+            } catch (e) {
+              console.warn(`feed-delta: lease on ${feed} not released: ${e instanceof Error ? e.message : e}`)
+            }
+          },
+        },
+      }
+    },
+  }
 }
 
 async function gzip(text: string): Promise<Blob> {
@@ -136,6 +290,25 @@ async function gunzip(data: ArrayBuffer): Promise<string> {
 }
 
 export const DELTA_BUCKET = 'dosafe-feed-state'
+/** file_size_limit of the bucket, as its migration sets it. */
+export const DELTA_BUCKET_LIMIT_BYTES = 50 * 1024 * 1024
+
+/**
+ * Whether a Storage error answer means "no such object" or "no such bucket". Storage answers those
+ * with HTTP 400 and the real status in the body ({"statusCode":"404","error":"not_found"} or
+ * "Bucket not found"); a later version may answer 404 itself. Any other 400 is a real failure.
+ */
+export function isStorageNotFound(status: number, body: string): boolean {
+  if (status === 404) return true
+  if (status !== 400) return false
+  try {
+    const b = JSON.parse(body) as { statusCode?: unknown; code?: unknown; error?: unknown }
+    return String(b.statusCode) === '404' || b.code === 'NoSuchKey' || b.code === 'NoSuchBucket' ||
+      b.error === 'not_found' || b.error === 'Bucket not found'
+  } catch {
+    return false
+  }
+}
 
 /** State kept as one gzip JSON object per feed in a private Supabase Storage bucket. */
 export function storageDeltaStore(opts: {
@@ -157,8 +330,8 @@ export function storageDeltaStore(opts: {
       try {
         const res = await doFetch(objectUrl(feed), { headers, signal: AbortSignal.timeout(timeoutMs) })
         if (!res.ok) {
-          await res.body?.cancel()
-          if (res.status !== 400 && res.status !== 404) console.warn(`feed-delta: no state for ${feed} (HTTP ${res.status})`)
+          const body = await res.text().catch(() => '')
+          if (!isStorageNotFound(res.status, body)) console.warn(`feed-delta: no state for ${feed} (HTTP ${res.status})`)
           return null
         }
         return parseState(JSON.parse(await gunzip(await res.arrayBuffer())))
@@ -170,9 +343,14 @@ export function storageDeltaStore(opts: {
     async clear(feed) {
       try {
         const res = await doFetch(objectUrl(feed), { method: 'DELETE', headers, signal: AbortSignal.timeout(timeoutMs) })
-        await res.body?.cancel()
-        // Storage answers 400 or 404 for an object (or a bucket) that does not exist.
-        return res.ok || res.status === 400 || res.status === 404
+        if (res.ok) {
+          await res.body?.cancel()
+          return true
+        }
+        // Nothing to remove (no such object, or no bucket yet) is a success; any other error is not.
+        if (isStorageNotFound(res.status, await res.text().catch(() => ''))) return true
+        console.warn(`feed-delta: state for ${feed} not cleared (HTTP ${res.status})`)
+        return false
       } catch (e) {
         console.warn(`feed-delta: state for ${feed} not cleared: ${e instanceof Error ? e.message : e}`)
         return false
@@ -180,14 +358,19 @@ export function storageDeltaStore(opts: {
     },
     async save(feed, state) {
       try {
+        const body = await gzip(JSON.stringify(state))
+        // HaGeZi's state is ~22 MB (DOS/DOS.AI#7625): say so well before it reaches the limit.
+        if (body.size > DELTA_BUCKET_LIMIT_BYTES * 0.6) {
+          console.warn(`feed-delta: state for ${feed} is ${body.size} bytes, over 60% of the bucket's ${DELTA_BUCKET_LIMIT_BYTES}-byte limit`)
+        }
         const res = await doFetch(objectUrl(feed), {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/gzip', 'x-upsert': 'true' },
-          body: await gzip(JSON.stringify(state)),
+          body,
           signal: AbortSignal.timeout(timeoutMs),
         })
         await res.body?.cancel()
-        if (!res.ok) console.warn(`feed-delta: state for ${feed} not saved (HTTP ${res.status})`)
+        if (!res.ok) console.warn(`feed-delta: state for ${feed} not saved (HTTP ${res.status}, ${body.size} bytes)`)
         return res.ok
       } catch (e) {
         console.warn(`feed-delta: state for ${feed} not saved: ${e instanceof Error ? e.message : e}`)
