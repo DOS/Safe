@@ -25,7 +25,12 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 // One run of this feed at a time (DOS/DOS.AI#7625): the lease lasts the job's timeout and is
 // released when the script ends, also when it throws.
-await using lease = await scriptFeedLease(rpcFeedLeases({ url: SUPABASE_URL, key: SUPABASE_KEY }), "metamask", 30 * 60);
+await using lease = await scriptFeedLease(rpcFeedLeases({ url: SUPABASE_URL, key: SUPABASE_KEY }), "metamask", 30 * 60)
+  .catch(async (e) => {
+    // A lease error is a failed run: log it so the failure alert sees it (a held lease is not one).
+    await logFinish(await logStart(), "failed", 0, 0, `feed lease unavailable: ${e instanceof Error ? e.message : e}`);
+    throw e;
+  });
 if (!lease) Deno.exit(0);
 
 // ─── Sync log helpers (match Edge Function format for DOSiren) ───

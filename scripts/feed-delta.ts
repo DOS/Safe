@@ -191,7 +191,9 @@ const NO_LEASE: FeedLease = { supported: false, renew: async () => 'held', relea
 
 /** How often a script renews its lease while it sends, and how long before expiry it gives up. */
 export const SCRIPT_LEASE_RENEW_EVERY_MS = 5 * 60 * 1000
-const SCRIPT_LEASE_MARGIN_MS = 5 * 60 * 1000
+// Covers one chunk with all its retries (three 120 s requests and two 5 s pauses, 370 s in the
+// importers), so a chunk ensure() lets through finishes before the lease can expire.
+const SCRIPT_LEASE_MARGIN_MS = 10 * 60 * 1000
 
 export interface ScriptFeedLease extends FeedLease, AsyncDisposable {
   /**
