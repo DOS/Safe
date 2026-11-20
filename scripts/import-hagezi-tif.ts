@@ -14,7 +14,7 @@
  */
 
 import { parseTifDomains, TIF_URL } from "./hagezi-tif.ts";
-import { planDelta, startRun, storageDeltaStore } from "./feed-delta.ts";
+import { finishRun, planDelta, rpcFeedLeases, savedRunStatus, scriptFeedLease, startRun, storageDeltaStore } from "./feed-delta.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -25,6 +25,11 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   );
   Deno.exit(1);
 }
+
+// One run of this feed at a time (DOS/DOS.AI#7625): the lease lasts the job's timeout and is
+// released when the script ends, also when it throws.
+await using lease = await scriptFeedLease(rpcFeedLeases({ url: SUPABASE_URL, key: SUPABASE_KEY }), "hagezi_tif", 90 * 60);
+if (!lease) Deno.exit(0);
 
 const CHUNK_SIZE = 5000;
 
@@ -48,12 +53,14 @@ const feedEntries = uniqueDomains.map((domain) => ({
 // Between full sends (every 6 days) only new or changed entries are sent (DOS/DOS.AI#7620).
 const deltaStore = storageDeltaStore({ url: SUPABASE_URL!, key: SUPABASE_KEY! });
 const plan = await planDelta(feedEntries, await deltaStore.load("hagezi_tif"), Date.now());
-const entries = await startRun(deltaStore, "hagezi_tif", plan, feedEntries);
+const entries = await startRun(deltaStore, "hagezi_tif", plan);
 console.log(`Sending ${entries.length} of ${feedEntries.length} entries (${plan.reason})`);
 
 let totalAdded = 0;
 
 for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+  // Stop writing if this run no longer holds the feed (DOS/DOS.AI#7625).
+  await lease.ensure();
   const chunk = entries.slice(i, i + CHUNK_SIZE);
   const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
   const totalChunks = Math.ceil(entries.length / CHUNK_SIZE);
@@ -115,7 +122,9 @@ for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
 console.log(`\nDone! Total uploaded: ${totalAdded}/${entries.length}`);
 // Complete when the feed was not empty and every entry sent was stored (a delta run may send none).
 const uploadComplete = feedEntries.length > 0 && totalAdded === entries.length;
-if (uploadComplete) await deltaStore.save("hagezi_tif", plan.next);
+// The state is saved while this run still holds the lease; a failed save makes the run partial,
+// which alerts (DOS/DOS.AI#7625).
+const saved = uploadComplete ? savedRunStatus(await finishRun(deltaStore, lease, "hagezi_tif", plan.next)) : null;
 
 // Write to sync_log for health monitoring
 // After source consolidation, HaGeZi TIF is the sole domain source — monitoring is critical.
@@ -135,9 +144,9 @@ try {
       finished_at: new Date().toISOString(),
       entries_processed: entries.length,
       entries_added: totalAdded,
-      status: uploadComplete ? "success" : "failed",
-      error: uploadComplete
-        ? null
+      status: saved ? saved.status : "failed",
+      error: saved
+        ? saved.error
         : `Incomplete upload: ${totalAdded}/${entries.length}`,
     }),
   });

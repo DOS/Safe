@@ -1,4 +1,4 @@
-import { isCompleteUpload, parseTifDomains, TIF_URL } from "./hagezi-tif.ts";
+import { parseTifDomains, TIF_URL } from "./hagezi-tif.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -28,9 +28,4 @@ Deno.test("parseTifDomains removes metadata, blanks, case variants, and duplicat
   assertEquals(parseTifDomains(input), ["example.com", "evil.test"]);
 });
 
-Deno.test("isCompleteUpload rejects empty and partial imports", () => {
-  assertEquals(isCompleteUpload(0, 0), false);
-  assertEquals(isCompleteUpload(5_000, 10_000), false);
-  assertEquals(isCompleteUpload(10_000, 10_000), true);
-});
 

@@ -4,11 +4,9 @@
  *
  * Only blocking categories are written (DOS/DOS.AI#7444). The database
  * functions already return only active, unexpired rows of these categories
- * whose value is not an active trusted entity (DOS/DOS.Me migration
- * 20261117130000_dosafe_blacklist_export_blocking_only.sql); the check here
- * keeps a row such as `legitimate` out of the files even if a database has not
- * received that migration. Keep the lists equal to the migration's and to
- * DOS/DOS.AI apps/dosafe-web/src/lib/blocklist-categories.ts.
+ * whose value is not an active trusted entity; the check here keeps a row such
+ * as `legitimate` out of the files even if a database does not filter yet. Keep
+ * the lists equal to the database functions' and to the DOSafe web app's.
  *
  * Allow-lists: a category a feed adds later stays out until it is reviewed.
  */

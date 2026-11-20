@@ -1,12 +1,20 @@
 import {
   type DeltaState,
+  type FeedLease,
+  finishRun,
   FULL_SEND_EVERY_MS,
   fingerprintOf,
+  isStorageNotFound,
   parseState,
   planDelta,
+  rpcFeedLeases,
+  SCRIPT_LEASE_RENEW_EVERY_MS,
+  savedRunStatus,
+  scriptFeedLease,
   startRun,
   stableJson,
   storageDeltaStore,
+  TOMBSTONE_STATE,
 } from './feed-delta.ts'
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -21,6 +29,9 @@ const NOW = Date.parse('2026-11-17T06:00:00Z')
 const a = { entity_type: 'domain', entity_value: 'a.example', source: 'feed', category: 'phishing', risk_score: 80, raw_data: { list: 'x' } }
 const b = { entity_type: 'domain', entity_value: 'b.example', source: 'feed', category: 'phishing', risk_score: 80, raw_data: {} }
 const c = { entity_type: 'domain', entity_value: 'c.example', source: 'feed', category: 'scam', risk_score: 70, raw_data: {} }
+
+// Storage's answer for a missing object (HTTP 400, the real status in the body).
+const NOT_FOUND = '{"statusCode":"404","code":"NoSuchKey","error":"not_found","message":"Object not found"}'
 
 async function stateOf(entries: unknown[], lastFullAt: string): Promise<DeltaState> {
   return { v: 1, lastFullAt, fingerprints: await Promise.all(entries.map(fingerprintOf)) }
@@ -88,14 +99,15 @@ Deno.test('storageDeltaStore saves gzip JSON and loads it back; a missing object
   const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
     if (init?.method === 'DELETE') {
-      return new Response('{}', { status: objects.delete(url) ? 200 : 400 })
+      // What Storage answers for an object that does not exist.
+      return objects.delete(url) ? new Response('{}', { status: 200 }) : new Response(NOT_FOUND, { status: 400 })
     }
     if (init?.method === 'POST') {
       objects.set(url, new Uint8Array(await new Response(init.body).arrayBuffer()))
       return new Response('{}', { status: 200 })
     }
     const body = objects.get(url)?.slice().buffer as ArrayBuffer | undefined
-    return body ? new Response(body, { status: 200 }) : new Response('{"error":"not_found"}', { status: 400 })
+    return body ? new Response(body, { status: 200 }) : new Response(NOT_FOUND, { status: 400 })
   }) as typeof fetch
   const store = storageDeltaStore({ url: 'https://db.example', key: 'k', fetch: fakeFetch })
   assertEquals(await store.load('watchlist_internet'), null)
@@ -109,16 +121,173 @@ Deno.test('storageDeltaStore saves gzip JSON and loads it back; a missing object
   assertEquals(await store.clear('watchlist_internet'), true)
 })
 
-Deno.test('startRun removes the state before writing; when it cannot, the whole feed is sent', async () => {
+Deno.test('startRun removes the state before writing; when it cannot, it writes a tombstone; else nothing is sent', async () => {
   const lastFull = new Date(NOW - 86_400_000).toISOString()
   const plan = await planDelta([a, b, c], await stateOf([a, b], lastFull), NOW)
   assertEquals(plan.entries, [c])
   const cleared: string[] = []
-  const ok = { load: () => Promise.resolve(null), save: () => Promise.resolve(true), clear: (f: string) => { cleared.push(f); return Promise.resolve(true) } }
-  assertEquals(await startRun(ok, 'feed', plan, [a, b, c]), [c])
-  assertEquals(cleared, ['feed'])
+  const saved: DeltaState[] = []
+  const ok = {
+    load: () => Promise.resolve(null),
+    save: (_f: string, st: DeltaState) => { saved.push(st); return Promise.resolve(true) },
+    clear: (f: string) => { cleared.push(f); return Promise.resolve(true) },
+  }
+  assertEquals(await startRun(ok, 'feed', plan), [c])
+  assertEquals([cleared, saved.length], [['feed'], 0])
+  // DOS/DOS.AI#7625: the state could not be removed, so it is overwritten with a tombstone.
   const stuck = { ...ok, clear: () => Promise.resolve(false) }
-  assertEquals(await startRun(stuck, 'feed', plan, [a, b, c]), [a, b, c])
+  assertEquals(await startRun(stuck, 'feed', plan), [c])
+  assertEquals(saved, [TOMBSTONE_STATE])
+  // Neither works: the old fingerprints would stay, so the run must not write.
+  const broken = { ...stuck, save: () => Promise.resolve(false) }
+  let threw = false
+  try {
+    await startRun(broken, 'feed', plan)
+  } catch {
+    threw = true
+  }
+  assertEquals(threw, true)
+})
+
+Deno.test('a tombstone state asks for a full send', async () => {
+  const plan = await planDelta([a, b], parseState(JSON.parse(JSON.stringify(TOMBSTONE_STATE))), NOW)
+  assertEquals([plan.full, plan.reason, plan.entries.length], [true, 'refresh_due', 2])
+})
+
+Deno.test('isStorageNotFound: only a missing object or bucket', () => {
+  assertEquals(isStorageNotFound(404, ''), true)
+  assertEquals(isStorageNotFound(400, NOT_FOUND), true)
+  assertEquals(isStorageNotFound(400, '{"statusCode":"404","code":"NoSuchBucket","error":"Bucket not found","message":"Bucket not found"}'), true)
+  assertEquals(isStorageNotFound(400, '{"statusCode":"403","code":"InvalidJWT","error":"InvalidJWT","message":"jwt expired"}'), false)
+  assertEquals(isStorageNotFound(400, 'not json'), false)
+  assertEquals(isStorageNotFound(400, '{}'), false)
+  assertEquals(isStorageNotFound(500, NOT_FOUND), false)
+})
+
+Deno.test('storageDeltaStore.clear fails on any error other than not found', async () => {
+  const answering = (status: number, body: string) =>
+    storageDeltaStore({ url: 'https://db.example', key: 'k', fetch: (() => Promise.resolve(new Response(body, { status }))) as typeof fetch })
+  assertEquals(await answering(500, '{"statusCode":"500","error":"internal"}').clear('f'), false)
+  assertEquals(await answering(400, '{"statusCode":"403","code":"InvalidJWT","error":"InvalidJWT"}').clear('f'), false)
+  assertEquals(await answering(400, NOT_FOUND).clear('f'), true)
+  assertEquals(await answering(404, '').clear('f'), true)
+})
+
+// DOS/DOS.AI#7625: one run of a feed at a time.
+
+function leaseServer(answers: Record<string, (args: Record<string, unknown>) => Response>) {
+  const calls: { fn: string; args: Record<string, unknown> }[] = []
+  const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const fn = String(input).split('/rpc/')[1]
+    const args = JSON.parse(String(init?.body))
+    calls.push({ fn, args })
+    const answer = answers[fn]
+    if (!answer) throw new Error(`unexpected call ${fn}`)
+    return answer(args)
+  }) as typeof fetch
+  return {
+    calls,
+    leases: rpcFeedLeases({ url: 'https://db.example', key: 'k', fetch: fakeFetch, newHolder: () => 'h-1' }),
+    defaultLeases: rpcFeedLeases({ url: 'https://db.example', key: 'k', fetch: fakeFetch }),
+  }
+}
+
+const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status })
+
+Deno.test('rpcFeedLeases: a free feed is leased, renewed and released by this holder', async () => {
+  const { calls, leases } = leaseServer({
+    acquire_feed_lease: () => json({ acquired: true, expires_at: '2026-11-18T00:15:00Z' }),
+    renew_feed_lease: () => json(true),
+    release_feed_lease: () => json(true),
+  })
+  const r = await leases.acquire('urlhaus', 900)
+  if (!r.held) throw new Error('expected the lease')
+  assertEquals(r.lease.supported, true)
+  assertEquals(await r.lease.renew(), 'held')
+  await r.lease.release()
+  assertEquals(calls, [
+    { fn: 'acquire_feed_lease', args: { p_feed: 'urlhaus', p_holder: 'h-1', p_ttl_seconds: 900 } },
+    { fn: 'renew_feed_lease', args: { p_feed: 'urlhaus', p_holder: 'h-1', p_ttl_seconds: 900 } },
+    { fn: 'release_feed_lease', args: { p_feed: 'urlhaus', p_holder: 'h-1' } },
+  ])
+})
+
+Deno.test('rpcFeedLeases: every acquire has its own holder, so two runs in one isolate exclude each other', async () => {
+  const { calls, defaultLeases } = leaseServer({ acquire_feed_lease: () => json({ acquired: true }) })
+  await defaultLeases.acquire('urlhaus', 900)
+  await defaultLeases.acquire('urlhaus', 900)
+  const holders = calls.map((c) => c.args.p_holder)
+  assertEquals([typeof holders[0], holders[0] === holders[1]], ['string', false])
+})
+
+Deno.test('rpcFeedLeases: a held feed is reported with its expiry', async () => {
+  const { leases } = leaseServer({ acquire_feed_lease: () => json({ acquired: false, expires_at: '2026-11-18T00:15:00Z' }) })
+  assertEquals(await leases.acquire('urlhaus', 900), { held: false, until: '2026-11-18T00:15:00Z' })
+})
+
+Deno.test('rpcFeedLeases: without the lease functions the run goes on unprotected; other errors throw', async () => {
+  const missing = leaseServer({ acquire_feed_lease: () => json({ code: 'PGRST202', message: 'Could not find the function' }, 404) })
+  const r = await missing.leases.acquire('urlhaus', 900)
+  if (!r.held) throw new Error('expected a lease stand-in')
+  assertEquals([r.lease.supported, await r.lease.renew()], [false, 'held'])
+  await r.lease.release()
+  assertEquals(missing.calls.length, 1)
+
+  const down = leaseServer({ acquire_feed_lease: () => json({ message: 'boom' }, 503) })
+  let threw = false
+  try {
+    await down.leases.acquire('urlhaus', 900)
+  } catch {
+    threw = true
+  }
+  assertEquals(threw, true)
+})
+
+Deno.test('rpcFeedLeases: a lost lease and a failed renewal are told apart', async () => {
+  const lost = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), renew_feed_lease: () => json(false) })
+  const r = await lost.leases.acquire('urlhaus', 900)
+  if (!r.held) throw new Error('expected the lease')
+  assertEquals(await r.lease.renew(), 'lost')
+  const failing = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), renew_feed_lease: () => json({}, 500) })
+  const f = await failing.leases.acquire('urlhaus', 900)
+  if (!f.held) throw new Error('expected the lease')
+  assertEquals(await f.lease.renew(), 'error')
+})
+
+Deno.test('finishRun saves only while the lease is held', async () => {
+  const saved: string[] = []
+  const store = {
+    load: () => Promise.resolve(null),
+    save: (f: string) => { saved.push(f); return Promise.resolve(true) },
+    clear: () => Promise.resolve(true),
+  }
+  const lease = (r: 'held' | 'lost' | 'error'): FeedLease => ({ supported: true, renew: () => Promise.resolve(r), release: () => Promise.resolve() })
+  const next = await stateOf([a], new Date(NOW).toISOString())
+  assertEquals(await finishRun(store, lease('lost'), 'feed', next), 'lease_lost')
+  // A failed renewal: not known to be held, so no save, and reported like a failed save (it alerts).
+  assertEquals(await finishRun(store, lease('error'), 'feed', next), 'not_saved')
+  assertEquals(saved, [])
+  assertEquals(await finishRun(store, lease('held'), 'feed', next), 'saved')
+  assertEquals(saved, ['feed'])
+  assertEquals(await finishRun({ ...store, save: () => Promise.resolve(false) }, lease('held'), 'feed', next), 'not_saved')
+})
+
+Deno.test('savedRunStatus: a failed save makes the run partial, which alerts', () => {
+  assertEquals(savedRunStatus('saved'), { status: 'success', error: null })
+  assertEquals(savedRunStatus('lease_lost'), { status: 'success', error: null })
+  assertEquals(savedRunStatus('not_saved').status, 'partial')
+})
+
+Deno.test('scriptFeedLease: none when held elsewhere; released when the scope ends', async () => {
+  const busy = leaseServer({ acquire_feed_lease: () => json({ acquired: false, expires_at: 't' }) })
+  assertEquals(await scriptFeedLease(busy.leases, 'hagezi_tif', 5400), null)
+
+  const free = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), release_feed_lease: () => json(true) })
+  {
+    await using lease = await scriptFeedLease(free.leases, 'hagezi_tif', 5400)
+    assertEquals(lease?.supported, true)
+  }
+  assertEquals(free.calls.map((c) => c.fn), ['acquire_feed_lease', 'release_feed_lease'])
 })
 
 Deno.test('storageDeltaStore treats an unreadable object or a failed call as no state', async () => {
@@ -136,4 +305,45 @@ Deno.test('storageDeltaStore treats an unreadable object or a failed call as no 
   assertEquals(await down.load('f'), null)
   assertEquals(await down.save('f', await stateOf([a], new Date(NOW).toISOString())), false)
   assertEquals(await down.clear('f'), false)
+})
+
+Deno.test('scriptFeedLease.ensure renews every few minutes and stops a run that lost the feed', async () => {
+  let clock = 0
+  let answer: () => Response = () => json(true)
+  const server = leaseServer({ acquire_feed_lease: () => json({ acquired: true }), renew_feed_lease: () => answer() })
+  const lease = await scriptFeedLease(server.leases, 'hagezi_tif', 5400, { now: () => clock })
+  if (!lease) throw new Error('expected the lease')
+  const renewals = () => server.calls.filter((c) => c.fn === 'renew_feed_lease').length
+  const throws = async () => {
+    try {
+      await lease.ensure()
+      return false
+    } catch {
+      return true
+    }
+  }
+  await lease.ensure()
+  assertEquals(renewals(), 0)
+  clock = SCRIPT_LEASE_RENEW_EVERY_MS
+  await lease.ensure()
+  assertEquals(renewals(), 1)
+  // A failed call while the lease is still clearly valid: the run goes on.
+  answer = () => json({}, 503)
+  clock += SCRIPT_LEASE_RENEW_EVERY_MS
+  assertEquals(await throws(), false)
+  // Too close to the expiry without a confirmed renewal: the run stops.
+  clock = SCRIPT_LEASE_RENEW_EVERY_MS + 5400 * 1000 - 60_000
+  assertEquals(await throws(), true)
+  // Another run took the feed: the run stops at once.
+  answer = () => json(false)
+  clock = 0
+  const fresh = await scriptFeedLease(server.leases, 'hagezi_tif', 5400, { now: () => clock })
+  clock = SCRIPT_LEASE_RENEW_EVERY_MS
+  let stopped = false
+  try {
+    await fresh!.ensure()
+  } catch {
+    stopped = true
+  }
+  assertEquals(stopped, true)
 })
