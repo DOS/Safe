@@ -1,4 +1,5 @@
 import {
+  entityHashOrder,
   type DeltaState,
   type FeedLease,
   finishRun,
@@ -57,10 +58,41 @@ Deno.test('between full sends only new and changed entries are sent', async () =
   const changedA = { ...a, risk_score: 95 }
   const plan = await planDelta([changedA, b, c], await stateOf([a, b], lastFull), NOW)
   assertEquals([plan.full, plan.reason], [false, 'delta'])
-  assertEquals(plan.entries, [changedA, c])
+  assertEquals(plan.entries, await entityHashOrder([changedA, c]))
+  assertEquals(plan.entries.length, 2)
   // The full send time does not move; the fingerprints are the whole current feed.
   assertEquals(plan.next.lastFullAt, lastFull)
   assertEquals(plan.next.fingerprints, await Promise.all([changedA, b, c].map(fingerprintOf)))
+})
+
+// DOS/DOS.AI#7925: entries go out in the order of the conflict index, entity_hash.
+async function dbEntityHash(value: string): Promise<string> {
+  // dosafe.bulk_upsert_threats: '0x' || encode(digest(lower(entity_value), 'sha256'), 'hex')
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value.toLowerCase())))
+  return '0x' + Array.from(digest, (x) => x.toString(16).padStart(2, '0')).join('')
+}
+
+Deno.test('entries are sent in entity_hash order, every one of them, whatever the plan', async () => {
+  const feed = Array.from({ length: 300 }, (_, i) => ({ ...b, entity_value: `Host-${i}.Example` }))
+  const expected = [...feed]
+  const hashes = new Map(await Promise.all(feed.map(async (e) => [e, await dbEntityHash(e.entity_value)] as const)))
+  expected.sort((x, y) => (hashes.get(x)! < hashes.get(y)! ? -1 : 1))
+
+  const full = await planDelta(feed, null, NOW)
+  assertEquals(full.entries, expected)
+  // The saved fingerprints keep the feed order; only the send order changes.
+  assertEquals(full.next.fingerprints, await Promise.all(feed.map(fingerprintOf)))
+
+  const delta = await planDelta(feed, await stateOf(feed.slice(0, 100), new Date(NOW - 86_400_000).toISOString()), NOW)
+  assertEquals(delta.entries, expected.filter((e) => feed.indexOf(e) >= 100))
+})
+
+Deno.test('entityHashOrder keeps equal keys in order and puts entries without a value first', async () => {
+  const x1 = { entity_value: 'same.example', source: 's1' }
+  const x2 = { entity_value: 'SAME.example', source: 's2' }
+  const none = { source: 's3' }
+  assertEquals(await entityHashOrder([x1, x2, none]), [none, x1, x2])
+  assertEquals(await entityHashOrder([]), [])
 })
 
 Deno.test('an unchanged feed sends nothing between full sends', async () => {
