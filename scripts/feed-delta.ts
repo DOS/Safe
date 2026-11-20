@@ -15,6 +15,7 @@
 // upload fails, is followed by a full send: the fingerprints never describe rows the database no
 // longer has. One run of a feed at a time holds the feed's lease (rpcFeedLeases, finishRun).
 // Entries that leave the feed are not touched, as before; they age out on the existing schedule.
+// The entries to send come out in entity_hash order (entityHashOrder), which cuts the index reads.
 //
 // Why a full send at least every 6 days: bulk_upsert_threats refreshes a row's last_seen_at only
 // when it is older than 7 days, and dosafe.expire_unseen_threats expires rows unseen for 14 days
@@ -39,7 +40,7 @@ export interface DeltaState {
 }
 
 export interface DeltaPlan<T> {
-  /** The entries to send this run. */
+  /** The entries to send this run, in entity_hash order (entityHashOrder). */
   entries: T[]
   full: boolean
   reason: 'no_state' | 'refresh_due' | 'delta'
@@ -70,6 +71,43 @@ export async function fingerprintOf(entry: unknown): Promise<string> {
   return hex
 }
 
+// ─── Send order (DOS/DOS.AI#7925) ───
+//
+// bulk_upsert_threats finds the stored row of each entry through the unique index on
+// dosafe.threat_intel (entity_hash, source), where entity_hash is '0x' || sha256(lower(entity_value)).
+// Sent in feed order, the entries of one chunk sit on as many different leaves of that index (1 GB on
+// Production, against 512 MB of shared_buffers), so nearly every entry costs a disk read for its leaf
+// on top of the read for its row. Sent in entity_hash order, a chunk of a large feed covers one narrow
+// key range and its entries share a few hundred leaves. Measured on Beta (read-only, same probe as the
+// conflict check): 1.56 blocks read per entry in feed order, 0.91 in hash order. Only the order
+// changes: every entry is still sent, and the database sorts each call by entity_hash itself.
+
+/** The first 64 bits of sha256(lower(entity_value)), as hex: the order of the conflict index. */
+async function entityHashKey(entry: unknown): Promise<string> {
+  const value = (entry as { entity_value?: unknown } | null)?.entity_value
+  if (typeof value !== 'string') return ''
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value.toLowerCase())))
+  let hex = ''
+  for (let i = 0; i < 8; i++) hex += HEX[digest[i]]
+  return hex
+}
+
+/**
+ * The entries in entity_hash order (stable: equal keys keep their order). An entry without a
+ * string entity_value sorts first; the order only affects how many index pages a chunk reads.
+ */
+export async function entityHashOrder<T>(entries: T[]): Promise<T[]> {
+  const keys = new Array<string>(entries.length)
+  const BATCH = 4096
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const part = await Promise.all(entries.slice(i, i + BATCH).map(entityHashKey))
+    for (let j = 0; j < part.length; j++) keys[i + j] = part[j]
+  }
+  const order = Array.from({ length: entries.length }, (_, i) => i)
+  order.sort((x, y) => (keys[x] < keys[y] ? -1 : keys[x] > keys[y] ? 1 : x - y))
+  return order.map((i) => entries[i])
+}
+
 async function fingerprintAll(entries: unknown[]): Promise<string[]> {
   const out = new Array<string>(entries.length)
   const BATCH = 4096
@@ -86,15 +124,15 @@ export async function planDelta<T>(entries: T[], previous: DeltaState | null, no
   const lastFullMs = previous ? Date.parse(previous.lastFullAt) : NaN
 
   if (!previous || !Number.isFinite(lastFullMs) || lastFullMs > nowMs) {
-    return { entries, full: true, reason: 'no_state', next: { v: STATE_VERSION, lastFullAt: startedAt, fingerprints } }
+    return { entries: await entityHashOrder(entries), full: true, reason: 'no_state', next: { v: STATE_VERSION, lastFullAt: startedAt, fingerprints } }
   }
   if (nowMs - lastFullMs >= FULL_SEND_EVERY_MS) {
-    return { entries, full: true, reason: 'refresh_due', next: { v: STATE_VERSION, lastFullAt: startedAt, fingerprints } }
+    return { entries: await entityHashOrder(entries), full: true, reason: 'refresh_due', next: { v: STATE_VERSION, lastFullAt: startedAt, fingerprints } }
   }
   const seen = new Set(previous.fingerprints)
   const send = entries.filter((_, i) => !seen.has(fingerprints[i]))
   return {
-    entries: send,
+    entries: await entityHashOrder(send),
     full: false,
     reason: 'delta',
     next: { v: STATE_VERSION, lastFullAt: previous.lastFullAt, fingerprints },
